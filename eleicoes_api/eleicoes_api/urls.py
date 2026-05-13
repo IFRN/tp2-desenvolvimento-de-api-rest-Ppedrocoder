@@ -42,6 +42,8 @@ router.register(r'votos', views.VotoViewSet)
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('eleicoes_api/', include(router.urls)),
+    path('eleicoes_api/verificar-comprovante/', views.verificar_comprovante, name='verificar-comprovante'),
+    path('eleicoes_api/comprovantes/qr/', views.comprovante_qr, name='comprovante-qr'),
     re_path(r'^swagger(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0), name='schema-json'),
     path('redoc/', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
     path('swagger/', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
