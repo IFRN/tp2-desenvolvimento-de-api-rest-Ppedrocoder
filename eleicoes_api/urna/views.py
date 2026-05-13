@@ -12,6 +12,7 @@ from django.db import IntegrityError
 import qrcode
 import io
 from django.http import HttpResponse
+import re
 
 class EleitorViewSet(viewsets.ModelViewSet):
     queryset = Eleitor.objects.all()
@@ -71,6 +72,127 @@ class EleicaoViewSet(viewsets.ModelViewSet):
 
         return Response(response_body, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['post'])
+    def abrir(self, request, pk=None):
+        eleicao = self.get_object()
+        if eleicao.status != 'rascunho':
+            return Response({'detail': 'Eleição deve estar em rascunho para ser aberta.'}, status=status.HTTP_400_BAD_REQUEST)
+        if eleicao.candidatos.count() < 2:
+            return Response({'detail': 'É necessário pelo menos 2 candidatos para abrir a eleição.'}, status=status.HTTP_400_BAD_REQUEST)
+        if eleicao.aptos.count() < 1:
+            return Response({'detail': 'É necessário pelo menos 1 eleitor apto para abrir a eleição.'}, status=status.HTTP_400_BAD_REQUEST)
+        eleicao.status = 'aberta'
+        eleicao.save()
+        return Response(EleicaoSerializer(eleicao).data)
+
+    @action(detail=True, methods=['post'])
+    def encerrar(self, request, pk=None):
+        eleicao = self.get_object()
+        if eleicao.status != 'aberta':
+            return Response({'detail': 'Eleição deve estar aberta para ser encerrada.'}, status=status.HTTP_400_BAD_REQUEST)
+        eleicao.status = 'encerrada'
+        eleicao.save()
+        return Response(EleicaoSerializer(eleicao).data)
+
+    @action(detail=True, methods=['get'])
+    def apuracao(self, request, pk=None):
+        eleicao = self.get_object()
+        if eleicao.status not in ('encerrada', 'apurada'):
+            return Response({'detail': 'Apuração disponível apenas para eleições encerradas ou apuradas.'}, status=status.HTTP_403_FORBIDDEN)
+        total_aptos = eleicao.aptos.count()
+        total_votantes = eleicao.registros_votacao.count()
+        total_abstencoes = total_aptos - total_votantes
+        votos_brancos = Voto.objects.filter(eleicao=eleicao, em_branco=True).count()
+        votos_validos = Voto.objects.filter(eleicao=eleicao, em_branco=False).count()
+        candidatos = list(eleicao.candidatos.all())
+        resultados = []
+        for candidato in candidatos:
+            votos = Voto.objects.filter(eleicao=eleicao, candidato=candidato, em_branco=False).count()
+            percentual = (votos / votos_validos * 100) if votos_validos > 0 else 0
+            resultados.append({'candidato': candidato, 'votos': votos, 'percentual': round(percentual, 2)})
+        resultados.sort(key=lambda x: x['votos'], reverse=True)
+        resultado_list = []
+        for idx, r in enumerate(resultados, start=1):
+            candidato = r['candidato']
+            resultado_list.append({
+                'posicao': idx,
+                'candidato': candidato.nome,
+                'numero': candidato.numero,
+                'votos': r['votos'],
+                'percentual': r['percentual'],
+            })
+        vencedores = []
+        houve_empate = False
+        if resultado_list:
+            max_votos = resultado_list[0]['votos']
+            vencedores = [r['candidato'] for r in resultado_list if r['votos'] == max_votos]
+            houve_empate = len(vencedores) > 1
+        comparecimento_pct = (total_votantes / total_aptos * 100) if total_aptos > 0 else 0
+        if eleicao.status == 'encerrada':
+            eleicao.status = 'apurada'
+            eleicao.save()
+
+        return Response({
+            'eleicao': eleicao.titulo,
+            'total_aptos': total_aptos,
+            'total_votantes': total_votantes,
+            'total_abstencoes': total_abstencoes,
+            'votos_validos': votos_validos,
+            'votos_brancos': votos_brancos,
+            'comparecimento_pct': round(comparecimento_pct, 2),
+            'resultado': resultado_list,
+            'vencedores': vencedores,
+            'houve_empate': houve_empate,
+        })
+
+    @action(detail=True, methods=['get'])
+    def votantes(self, request, pk=None):
+        eleicao = self.get_object()
+        compareceu = request.query_params.get('compareceu')
+        def mask_cpf(cpf):
+            digitos = re.sub(r'\D', '', cpf or '')
+            if len(digitos) >= 5:
+                return f"{digitos[:3]}.***.***-{digitos[-2:]}"
+            return cpf
+        if compareceu is not None and compareceu.lower() in ('false', '0'):
+            aptos = Eleitor.objects.filter(aptidoes__eleicao=eleicao).distinct()
+            votantes_qs = aptos.exclude(registros_votacao__eleicao=eleicao)
+            results = []
+            for eleitor in votantes_qs:
+                results.append({
+                    'nome': eleitor.nome,
+                    'cpf': mask_cpf(eleitor.cpf),
+                    'data_hora': None,
+                })
+            return Response(results)
+        registros = RegistroVotacao.objects.filter(eleicao=eleicao).select_related('eleitor').order_by('data_hora')
+        results = []
+        for reg in registros:
+            results.append({
+                'nome': reg.eleitor.nome,
+                'cpf': mask_cpf(reg.eleitor.cpf),
+                'data_hora': reg.data_hora.isoformat(),
+            })
+        return Response(results)
+
+    @action(detail=True, methods=['post'])
+    def cadastrar_aptos(self, request, pk=None):
+        eleicao = self.get_object()
+        if eleicao.status != 'rascunho':
+            return Response({'detail': 'Cadastro em lote permitido apenas enquanto eleição está em rascunho.'}, status=status.HTTP_400_BAD_REQUEST)
+        eleitores_ids = request.data.get('eleitores_ids')
+        if not isinstance(eleitores_ids, list):
+            return Response({'detail': 'O corpo deve conter "eleitores_ids" como lista.'}, status=status.HTTP_400_BAD_REQUEST)
+        ids_validos = list(Eleitor.objects.filter(pk__in=eleitores_ids).values_list('id', flat=True))
+        criar = []
+        for id in ids_validos:
+            if not AptidaoEleitor.objects.filter(eleitor_id=id, eleicao=eleicao).exists():
+                criar.append(AptidaoEleitor(eleitor_id=id, eleicao=eleicao))
+        total_cadastrados = 0
+        if criar:
+            AptidaoEleitor.objects.bulk_create(criar)
+            total_cadastrados = len(criar)
+        return Response({'total_cadastrados': total_cadastrados})
 
 class CandidatoViewSet(viewsets.ModelViewSet):
     queryset = Candidato.objects.select_related('eleicao').all()
